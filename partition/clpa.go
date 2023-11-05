@@ -1,6 +1,7 @@
 package partition
 
 import (
+	"container/heap"
 	"encoding/csv"
 	"errors"
 	"fmt"
@@ -27,6 +28,8 @@ type CLPAState struct {
 	MaxIterations     int // 最大迭代次数，constraint，对应论文中的\tau
 	CrossShardEdgeNum int // 跨分片边的总数
 	ShardNum          int // 分片数目
+
+	pq NodePriorityQueueforG
 }
 
 // 加入节点，需要将它默认归到一个分片中
@@ -153,6 +156,9 @@ func (cs *CLPAState) Init_CLPAState(wp float64, mIter, sn int) {
 	cs.ShardNum = sn         //8
 	cs.VertexsNumInShard = make([]int, cs.ShardNum)
 	cs.PartitionMap = make(map[Vertex]int)
+
+	cs.pq = make(NodePriorityQueueforG, 0)
+	heap.Init(&cs.pq)
 }
 
 // 初始化划分，使用节点地址的尾数划分，应该保证初始化的时候不会出现空分片
