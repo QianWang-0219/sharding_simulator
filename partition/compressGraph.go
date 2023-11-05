@@ -71,6 +71,7 @@ func (cg *CompressedGraph) AddVVertex(v Vertex) {
 		cg.VertexSet[virtualID] = &CompressedVertex{
 			VirtualID: virtualID,
 			Original:  make(map[Vertex]bool),
+			Load:      0,
 		}
 	}
 	// 把原始节点存入压缩图中对应的压缩节点

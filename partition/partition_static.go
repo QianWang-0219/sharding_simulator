@@ -2,6 +2,7 @@
 package partition
 
 import (
+	"container/heap"
 	"fmt"
 	"simple_go/sharding_simulator/params"
 	"simple_go/sharding_simulator/utils"
@@ -13,7 +14,7 @@ import (
 
 type PartitionStatic struct {
 	NetGraph          CompressedGraph
-	PartitionMap      map[int]int
+	PartitionMap      map[int]int //压缩节点id-分片id
 	Edges2Shard       []int
 	VertexsNumInShard []int
 	WeightPenalty     float64
@@ -22,6 +23,7 @@ type PartitionStatic struct {
 	MaxIterations     int
 	CrossShardEdgeNum int
 	ShardNum          int
+	pq                NodePriorityQueue
 }
 
 // 设置参数
@@ -31,6 +33,9 @@ func (ps *PartitionStatic) Init_PartitionStatic(wp float64, mIter, sn int) {
 	ps.ShardNum = sn         //8
 	ps.VertexsNumInShard = make([]int, ps.ShardNum)
 	ps.PartitionMap = make(map[int]int)
+
+	ps.pq = make(NodePriorityQueue, 0)
+	heap.Init(&ps.pq)
 
 	// 初始化压缩图
 	ps.NetGraph = CompressedGraph{
@@ -63,7 +68,7 @@ func (ps *PartitionStatic) AddVEdge(u, v Vertex) {
 }
 
 // 静态划分算法
-func (ps *PartitionStatic) PartitionStatic_Algorithm() map[string]uint64 {
+func (ps *PartitionStatic) PartitionStatic_Algorithm() map[int]int {
 	// 计算各个分片的负载，最大/最小分片负载，跨分片交易比例
 	ps.ComputeEdges2Shard()
 	fmt.Println("划分前跨分片交易数量:", ps.CrossShardEdgeNum)
@@ -111,22 +116,21 @@ func (ps *PartitionStatic) PartitionStatic_Algorithm() map[string]uint64 {
 	ps.ComputeEdges2Shard()
 	fmt.Println("划分后跨分片交易数量:", ps.CrossShardEdgeNum)
 
-	mmap := ps.NetGraph.VertexMapping ///mmap v.addr -> 虚拟id
-	m := make(map[string]uint64)
-	for v, shardid := range mmap {
-		//m[v.Addr] = uint64(utils.CompressV2Shard(shardid))
-		m[v.Addr] = uint64(ps.PartitionMap[shardid])
-	}
+	return ps.PartitionMap
+	// mmap := ps.NetGraph.VertexMapping ///mmap v.addr -> 虚拟id
+	// m := make(map[string]uint64)
+	// for v, shardid := range mmap {
+	// 	//m[v.Addr] = uint64(utils.CompressV2Shard(shardid))
+	// 	m[v.Addr] = uint64(ps.PartitionMap[shardid])
+	// }
 
-	return m /// return v.addr -> shard id; ps.PartitionMap: 虚拟id -> shard id
+	// return m /// return v.addr -> shard id; ps.PartitionMap: 虚拟id -> shard id
 }
 
 // 根据当前的划分，计算每个分片的负载，最大/最小分片负载，跨分片交易比例
 func (ps *PartitionStatic) ComputeEdges2Shard() {
 	ps.Edges2Shard = make([]int, ps.ShardNum)
 	interEdge := make([]int, ps.ShardNum) //临时参数
-	// ps.MinEdges2Shard = math.MinInt64
-	// ps.MaxEdges2Shard = math.MaxInt64
 	ps.CrossShardEdgeNum = 0
 
 	for idx := 0; idx < ps.ShardNum; idx++ {
@@ -152,6 +156,14 @@ func (ps *PartitionStatic) ComputeEdges2Shard() {
 	}
 
 	ps.CrossShardEdgeNum /= 2
+	totalEdge := 0.0
+	// 当前图的总交易数目为
+	for v, lst := range ps.NetGraph.EdgeSet {
+		totalEdge += float64(len(lst))/2.0 + float64(ps.NetGraph.VertexSet[v].Load)
+	}
+
+	fmt.Println("当前交易图的跨分片交易比例为：", float64(ps.CrossShardEdgeNum)/totalEdge)
+
 	// 各个分片的负载
 	for idx := 0; idx < params.ShardNum; idx++ {
 		ps.Edges2Shard[idx] += interEdge[idx] / 2
@@ -203,7 +215,7 @@ func (ps *PartitionStatic) changeShardRecompute(v, old int) {
 func (ps *PartitionStatic) fetchMap(i int) int {
 	if _, ok := ps.PartitionMap[i]; !ok {
 		ps.PartitionMap[i] = utils.CompressV2Shard(i)
-		ps.VertexsNumInShard[ps.PartitionMap[i]]++
+		//ps.VertexsNumInShard[ps.PartitionMap[i]]++
 	}
 	return ps.PartitionMap[i]
 }

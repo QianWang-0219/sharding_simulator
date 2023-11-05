@@ -2,6 +2,7 @@
 package partition
 
 import (
+	"container/heap"
 	"encoding/csv"
 	"fmt"
 	"io"
@@ -16,20 +17,19 @@ import (
 )
 
 type SimulatorGraph struct {
-	epoch               int
-	totTxNum            []int
-	totCrossTxNum       []int
 	txQueue             map[int][]*transaction
 	ctx                 float64
 	totaltx             float64
 	mutex               sync.Mutex
 	txGraph             *CLPAState
 	clpaLastRunningTime time.Time
+	CTR                 float64 //当前图划分下的割边比例
+	staticPartition     bool
 }
 
 type AccountCountforG struct {
 	Account string
-	ShardID int // 虚拟节点此时的分片id
+	ShardID int // ß节点此时的分片id
 	Count   int // 队列中与该节点相关的交易数量
 }
 
@@ -38,13 +38,12 @@ func NewSimulatorGraph() *SimulatorGraph {
 	cg.Init_CLPAState(0.5, 100, params.ShardNum)
 
 	return &SimulatorGraph{
-		epoch:         0,
-		totTxNum:      make([]int, 1),
-		totCrossTxNum: make([]int, 1),
-		txQueue:       make(map[int][]*transaction),
-		ctx:           0.0,
-		totaltx:       0.0,
-		txGraph:       cg,
+		txQueue:         make(map[int][]*transaction),
+		ctx:             0.0,
+		totaltx:         0.0,
+		txGraph:         cg,
+		CTR:             0.0,
+		staticPartition: false,
 	}
 }
 
@@ -91,7 +90,7 @@ func (sg *SimulatorGraph) Test_GraphPartition() {
 				//time.Sleep(time.Duration(params.ConsensusTime) * time.Millisecond)
 
 				for _, tx := range txs_Packed {
-					var ssid, vsid int 
+					var ssid, vsid int
 					if _, ok := sg.txGraph.PartitionMap[Vertex{Addr: tx.senderAddr}]; !ok {
 						ssid = utils.Addr2Shard(tx.senderAddr)
 					} else {
@@ -104,6 +103,9 @@ func (sg *SimulatorGraph) Test_GraphPartition() {
 					}
 
 					if ssid != vsid && !tx.relayed { //跨分片交易且还未处理
+						// 维持一个跨分片交易的优先队列
+						//sg.push2priorityQueue(tx)
+
 						sg.ctx += 0.5
 						sg.totaltx += 0.5
 						tx.relayed = true
@@ -153,6 +155,38 @@ func (sg *SimulatorGraph) Test_GraphPartition() {
 		}
 	}()
 
+	// 监控图划分的质量
+	go func() {
+		ticker := time.Tick(50 * time.Second)
+		for range ticker {
+			mmap := make(map[string]uint64)
+			sg.mutex.Lock()
+			for sg.staticPartition && (sg.txGraph.computeCTR()-sg.CTR) > 0.2 && len(mmap) < 100 {
+				// 增量式重划分
+				ctx := heap.Pop(&sg.txGraph.CtxQueue).(*CtxItem)
+				// 计算跨分片两边账户迁移的最小增益
+				SG_1 := 2*ctx.Count - len(sg.txGraph.NetGraph.EdgeSet[Vertex{Addr: ctx.Addr1}])
+				SG_2 := 2*ctx.Count - len(sg.txGraph.NetGraph.EdgeSet[Vertex{Addr: ctx.Addr2}])
+				if SG_1 > SG_2 && SG_1 > 0 { //将addr1移动到addr2所在的分片，对跨分片交易比例更友好
+					mmap[ctx.Addr1] = uint64(sg.txGraph.PartitionMap[Vertex{Addr: ctx.Addr2}])
+					tempOld := sg.txGraph.PartitionMap[Vertex{Addr: ctx.Addr1}]
+					sg.txGraph.PartitionMap[Vertex{Addr: ctx.Addr1}] = sg.txGraph.PartitionMap[Vertex{Addr: ctx.Addr2}]
+					sg.txGraph.changeShardRecompute(Vertex{Addr: ctx.Addr1}, tempOld)
+				} else if SG_1 < SG_2 && SG_2 > 0 { //将addr2移动到addr1所在的分片
+					mmap[ctx.Addr2] = uint64(sg.txGraph.PartitionMap[Vertex{Addr: ctx.Addr1}])
+					tempOld := sg.txGraph.PartitionMap[Vertex{Addr: ctx.Addr2}]
+					sg.txGraph.PartitionMap[Vertex{Addr: ctx.Addr2}] = sg.txGraph.PartitionMap[Vertex{Addr: ctx.Addr1}]
+					sg.txGraph.changeShardRecompute(Vertex{Addr: ctx.Addr2}, tempOld)
+				}
+			}
+			//交易池中交易迁移
+			if len(mmap) > 0 {
+				sg.migrationAcc(mmap)
+			}
+			sg.mutex.Unlock()
+		}
+	}()
+
 	// 添加一些新的边给图
 	for {
 		data, err := reader.Read() // 按行读取文件
@@ -199,34 +233,37 @@ func (sg *SimulatorGraph) Test_GraphPartition() {
 		}
 		datanum++
 
-		// 定期clpa重划分
-		if !sg.clpaLastRunningTime.IsZero() && time.Since(sg.clpaLastRunningTime) >= time.Duration(params.ClpaFreq)*time.Second {
+		// clpa划分
+		if !sg.staticPartition && !sg.clpaLastRunningTime.IsZero() && time.Since(sg.clpaLastRunningTime) >= time.Duration(params.ClpaFreq)*time.Second {
 			sg.mutex.Lock()
 			mmap, _ := sg.txGraph.CLPA_Partition() //需要移动的账户
-			// 迁移账户
+			sg.CTR = sg.txGraph.computeCTR()
+			// 迁移队列中的交易
 			sg.migrationAcc(mmap)
 
 			sg.mutex.Unlock()
 			time.Sleep(10 * time.Second)
-			sg.clpaLastRunningTime = time.Now()
+			//sg.clpaLastRunningTime = time.Now()
+			sg.staticPartition = true
 		}
 
 	}
 
-	// 交易发送完之后依旧要定期重划分
-	for {
-		time.Sleep(time.Second)
-		if time.Since(sg.clpaLastRunningTime) >= time.Duration(params.ClpaFreq)*time.Second {
-			sg.mutex.Lock()
-			mmap, _ := sg.txGraph.CLPA_Partition() //需要移动的账户
-			// 迁移账户
-			sg.migrationAcc(mmap)
+	select {}
+	// // 交易发送完之后依旧要定期重划分
+	// for {
+	// 	time.Sleep(time.Second)
+	// 	if time.Since(sg.clpaLastRunningTime) >= time.Duration(params.ClpaFreq)*time.Second {
+	// 		sg.mutex.Lock()
+	// 		mmap, _ := sg.txGraph.CLPA_Partition() //需要移动的账户
+	// 		// 迁移账户
+	// 		sg.migrationAcc(mmap)
 
-			sg.mutex.Unlock()
-			time.Sleep(10 * time.Second)
-			sg.clpaLastRunningTime = time.Now()
-		}
-	}
+	// 		sg.mutex.Unlock()
+	// 		time.Sleep(10 * time.Second)
+	// 		sg.clpaLastRunningTime = time.Now()
+	// 	}
+	// }
 }
 
 // 根据重划分结果，对队列中的交易进行迁移

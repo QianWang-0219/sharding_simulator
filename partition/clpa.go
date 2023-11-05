@@ -28,8 +28,7 @@ type CLPAState struct {
 	MaxIterations     int // 最大迭代次数，constraint，对应论文中的\tau
 	CrossShardEdgeNum int // 跨分片边的总数
 	ShardNum          int // 分片数目
-
-	pq NodePriorityQueueforG
+	CtxQueue          CtxPriorityQueue
 }
 
 // 加入节点，需要将它默认归到一个分片中
@@ -56,6 +55,17 @@ func (cs *CLPAState) AddEdge(u, v Vertex) {
 	cs.NetGraph.AddEdge(u, v)
 	// 可以批处理完之后再修改 Edges2Shard 等参数
 	// 当然也可以不处理，因为 CLPA 算法运行前会更新最新的参数
+
+	// 把跨分片交易加入跨分片交易的优先队列
+	if cs.PartitionMap[u] != cs.PartitionMap[v] {
+		cs.CrossShardEdgeNum++
+		cs.CtxQueue.push2priorityQueue(u.Addr, v.Addr)
+		cs.Edges2Shard[cs.PartitionMap[u]] += 1
+		cs.Edges2Shard[cs.PartitionMap[v]] += 1
+	} else {
+		cs.Edges2Shard[cs.PartitionMap[u]] += 1
+	}
+
 }
 
 // 输出CLPA
@@ -75,7 +85,6 @@ func (cs *CLPAState) PrintCLPA() {
 func (cs *CLPAState) ComputeEdges2Shard() {
 	cs.Edges2Shard = make([]int, cs.ShardNum)
 	interEdge := make([]int, cs.ShardNum)
-	//cs.MinEdges2Shard = 0x7fffffff // INT_MAX int32最大数
 
 	for idx := 0; idx < cs.ShardNum; idx++ {
 		cs.Edges2Shard[idx] = 0 // 把每个分片的负载置零
@@ -112,39 +121,46 @@ func (cs *CLPAState) ComputeEdges2Shard() {
 	for idx := 0; idx < cs.ShardNum; idx++ {
 		cs.Edges2Shard[idx] += interEdge[idx] / 2 // 每个分片的分片负载=内部负载+与自己相关的跨分负载（仅计算入度）
 	}
-	// 修改 MinEdges2Shard, CrossShardEdgeNum
-	// for _, val := range cs.Edges2Shard {
-	// 	if cs.MinEdges2Shard > val { // 找到最小的分片负载
-	// 		cs.MinEdges2Shard = val
-	// 	}
-	// }
+
 	// 求最大/最小分片负载
 	cs.MinEdges2Shard, cs.MaxEdges2Shard = utils.FindMinMax(cs.Edges2Shard)
+
 }
 
-// 在账户所属分片变动时，重新计算各个参数，faster
+func (cs *CLPAState) computeCTR() float64 {
+	// 计算跨分片交易比例
+	totalEdge := 0.0
+	// 当前图的总交易数目为
+	for _, lst := range cs.NetGraph.EdgeSet {
+		totalEdge += float64(len(lst)) / 2.0
+	}
+	// 返回当前图的跨分片交易数目
+	return float64(cs.CrossShardEdgeNum) / totalEdge
+}
+
+// 在账户所属分片变动时（单步），重新计算各个参数，faster
 func (cs *CLPAState) changeShardRecompute(v Vertex, old int) {
 	new := cs.PartitionMap[v]
 	for _, u := range cs.NetGraph.EdgeSet[v] {
 		neighborShard := cs.PartitionMap[u]
-		if neighborShard != new && neighborShard != old {
+		if neighborShard != new && neighborShard != old { // 这条边原本是跨分交易，现在依旧是跨片交易
 			cs.Edges2Shard[new]++
 			cs.Edges2Shard[old]--
-		} else if neighborShard == new {
+		} else if neighborShard == new { //原本是跨片交易，现在是片内交易
 			cs.Edges2Shard[old]--
 			cs.CrossShardEdgeNum--
+
+			//从ctx的优先队列中删除该跨分片交易的记录（在第一次调用的时候就全部删光了）
+			cs.CtxQueue.RemoveFromPriorityQueue(v.Addr, u.Addr)
+
 		} else {
 			cs.Edges2Shard[new]++
 			cs.CrossShardEdgeNum++
+
+			//在ctx中增加该分片的交易记录
+			cs.CtxQueue.push2priorityQueue(v.Addr, u.Addr)
 		}
 	}
-	cs.MinEdges2Shard = 0x7ffffffff
-	// 修改 MinEdges2Shard, CrossShardEdgeNum
-	// for _, val := range cs.Edges2Shard {
-	// 	if cs.MinEdges2Shard > val {
-	// 		cs.MinEdges2Shard = val
-	// 	}
-	// }
 	// 求最大/最小分片负载
 	cs.MinEdges2Shard, cs.MaxEdges2Shard = utils.FindMinMax(cs.Edges2Shard)
 }
@@ -156,9 +172,10 @@ func (cs *CLPAState) Init_CLPAState(wp float64, mIter, sn int) {
 	cs.ShardNum = sn         //8
 	cs.VertexsNumInShard = make([]int, cs.ShardNum)
 	cs.PartitionMap = make(map[Vertex]int)
+	cs.Edges2Shard = make([]int, cs.ShardNum)
 
-	cs.pq = make(NodePriorityQueueforG, 0)
-	heap.Init(&cs.pq)
+	cs.CtxQueue = make(CtxPriorityQueue, 0)
+	heap.Init(&cs.CtxQueue)
 }
 
 // 初始化划分，使用节点地址的尾数划分，应该保证初始化的时候不会出现空分片
@@ -216,7 +233,7 @@ func (cs *CLPAState) getShard_score(v Vertex, uShard int) float64 {
 // CLPA 划分算法
 func (cs *CLPAState) CLPA_Partition() (map[string]uint64, int) {
 	cs.ComputeEdges2Shard()
-	fmt.Println("初始化分片之后的跨分片交易比例:", float64(cs.CrossShardEdgeNum)/float64(params.TotalDataSize)) // 打印夸分批交易数目（默认）
+	fmt.Println("初始化分片之后的跨分片交易数目:", cs.CrossShardEdgeNum)
 	fmt.Println("初始化分片之后负载分布情况:", cs.Edges2Shard)
 	data4var := statistics.Float64{}
 	for _, val := range cs.Edges2Shard {
@@ -262,9 +279,9 @@ func (cs *CLPAState) CLPA_Partition() (map[string]uint64, int) {
 	// 	fmt.Printf("shard %d has vertexs: %d, and it has %d edges\n", sid, n, cs.Edges2Shard[sid])
 	// }
 
-	cs.ComputeEdges2Shard()                                                       // 计算分片负载，for遍历图的节点的时候，每次更新都会重新计算，为啥又重新计算？
+	//cs.ComputeEdges2Shard()                                                       // 计算分片负载，for遍历图的节点的时候，每次更新都会重新计算，为啥又重新计算？
 	fmt.Println("cross shard edge num after partitioning:", cs.CrossShardEdgeNum) // 打印稳定后跨分片交易数量
-	//fmt.Println(cs.CrossShardEdgeNum) // 打印稳定后跨分片交易数量
+
 	return res, cs.CrossShardEdgeNum // 返回map[string]uint64 res=节点-更新后的分片ID， CrossShardEdgeNum=系统的跨分片交易数量
 }
 
