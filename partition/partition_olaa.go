@@ -2,7 +2,6 @@ package partition
 
 import (
 	"container/heap"
-	"fmt"
 	"simple_go/sharding_simulator/utils"
 )
 
@@ -27,6 +26,7 @@ type OLAAState struct {
 func (ol *OLAAState) Init_OLAAState(sn int, l float64, e int, wp float64) {
 	ol.ShardNum = sn
 	ol.PartitionMap = make(map[Vertex]int)
+	ol.Edges2Shard = make([]int, ol.ShardNum)
 	ol.Queue2Shard = make([]int, ol.ShardNum)
 	ol.lambda = l
 	ol.epsilon = e
@@ -53,15 +53,15 @@ func (ol *OLAAState) AddEdge(u, v Vertex) {
 	// 在交易图中添加边的关系
 	ol.NetGraph.AddEdge(u, v) //增加交易图中的边
 
-	// 把跨分片交易加入跨分片交易的优先队列
-	if ol.PartitionMap[u] != ol.PartitionMap[v] {
-		ol.CrossShardEdgeNum++
-		ol.CtxQueue.push2priorityQueue(u.Addr, v.Addr)
-		ol.Edges2Shard[ol.PartitionMap[u]] += 1
-		ol.Edges2Shard[ol.PartitionMap[v]] += 1
-	} else {
-		ol.Edges2Shard[ol.PartitionMap[u]] += 1
-	}
+	// // 把跨分片交易加入跨分片交易的优先队列
+	// if ol.PartitionMap[u] != ol.PartitionMap[v] {
+	// 	ol.CrossShardEdgeNum++
+	// 	ol.CtxQueue.Push2priorityQueue(u.Addr, v.Addr)
+	// 	ol.Edges2Shard[ol.PartitionMap[u]] += 1
+	// 	ol.Edges2Shard[ol.PartitionMap[v]] += 1
+	// } else {
+	// 	ol.Edges2Shard[ol.PartitionMap[u]] += 1
+	// }
 
 }
 
@@ -102,13 +102,6 @@ func (ol *OLAAState) CalcCrossShardEdgeNum() {
 	}
 	ol.CrossShardEdgeNum /= 2
 
-	totalEdge := 0.0
-	for _, lst := range ol.NetGraph.EdgeSet {
-		totalEdge += float64(len(lst)) / 2.0
-	}
-
-	fmt.Println("此时交易图中的跨分片交易比例为：", float64(ol.CrossShardEdgeNum)/totalEdge)
-
 	for idx := 0; idx < ol.ShardNum; idx++ {
 		ol.Edges2Shard[idx] += interEdge[idx] / 2 // 每个分片的分片负载=内部负载+与自己相关的跨分负载（仅计算入度）
 	}
@@ -136,8 +129,25 @@ func (ol *OLAAState) getShard_score(v Vertex, uShardID int) float64 {
 	return score
 }
 
+// 计算当前交易图的跨分片交易比例和负载均衡情况
+func (ol *OLAAState) calculateCTR() (CTR, STD, COV float64) {
+	totalEdge := 0.0
+	for _, lst := range ol.NetGraph.EdgeSet {
+		totalEdge += float64(len(lst)) / 2.0
+	}
+	CTR = float64(ol.CrossShardEdgeNum) / totalEdge
+
+	loadbalance := utils.ConvertIntToFloat(ol.Edges2Shard)
+	// fmt.Println(loadbalance)
+	STD = utils.Std(loadbalance)
+
+	COV = utils.CoefficientOfVariation(loadbalance)
+
+	return
+}
+
 // 账户变动之后，重新计算各参数(单步)
-func (ol *OLAAState) ChangeShardRecompute(v Vertex, old, new int) {
+func (ol *OLAAState) changeShardRecompute(v Vertex, old, new int) {
 	for _, u := range ol.NetGraph.EdgeSet[v] {
 		neighborShard := ol.PartitionMap[u]
 		if neighborShard != new && neighborShard != old {
@@ -146,18 +156,23 @@ func (ol *OLAAState) ChangeShardRecompute(v Vertex, old, new int) {
 		} else if neighborShard == new {
 			ol.Edges2Shard[old]--
 			ol.CrossShardEdgeNum--
+			//从ctx的优先队列中删除该跨分片交易的记录（在第一次调用的时候就全部删光了）
+			//ol.CtxQueue.RemoveFromPriorityQueue(v.Addr, u.Addr)
+
 		} else {
 			ol.Edges2Shard[new]++
 			ol.CrossShardEdgeNum++
+			//在ctx中增加该分片的交易记录
+			//ol.CtxQueue.Push2priorityQueue(v.Addr, u.Addr)
 		}
 	}
 	ol.MinEdges2Shard, ol.MaxEdges2Shard = utils.FindMinMax(ol.Edges2Shard)
 }
 
 func (ol *OLAAState) OLAA_Partition(v Vertex) int {
-
+	//ol.CalcCrossShardEdgeNum()
 	// 为输入账户寻找最合适的分片 placement
-	// 判断账户v是否为新账户
+	// 判断账户v是否为新账户,已经有分配结果的直接返回结果
 	if _, ok := ol.PartitionMap[v]; !ok {
 		size := ol.ShardNum // 切片大小
 		// 为新账户分配一个合适的分片id
@@ -165,7 +180,6 @@ func (ol *OLAAState) OLAA_Partition(v Vertex) int {
 
 		// 计算适应度得分
 		scoreCross := make(map[int]float64)
-		//fmt.Println(ol.NetGraph.EdgeSet[v])
 		for _, u := range ol.NetGraph.EdgeSet[v] { //遍历当前节点v的相邻节点
 			if uShard, ok := ol.PartitionMap[u]; ok {
 				// 邻居节点已经分配账户了
@@ -178,10 +192,10 @@ func (ol *OLAAState) OLAA_Partition(v Vertex) int {
 
 		// 计算负载均衡得分
 		scoreBal := make([]float64, size)
-		minQ, maxQ := utils.FindMinMax(ol.Queue2Shard)
-		//fmt.Println("当前分片队列:", ol.Queue2Shard)
+		ol.MinEdges2Shard, ol.MaxEdges2Shard = utils.FindMinMax(ol.Edges2Shard)
 		for i := 0; i < ol.ShardNum; i++ {
-			scoreBal[i] = ol.lambda * float64(maxQ-ol.Queue2Shard[i]) / float64(ol.epsilon+maxQ-minQ)
+			//scoreBal[i] = ol.lambda * float64(maxQ-ol.Queue2Shard[i]) / float64(ol.epsilon+maxQ-minQ)
+			scoreBal[i] = ol.lambda * float64(ol.MaxEdges2Shard-ol.Edges2Shard[i]) / float64(ol.epsilon+ol.MaxEdges2Shard-ol.MinEdges2Shard)
 			//writer.Write([]string{"负载均衡得分", fmt.Sprintf("%d", i), fmt.Sprintf("%f", scoreBal[i])})
 			if _, ok := scoreCross[i]; ok {
 				totalScore[i] = scoreBal[i] + scoreCross[i]
@@ -190,8 +204,9 @@ func (ol *OLAAState) OLAA_Partition(v Vertex) int {
 			}
 		}
 		maxIndex, _ := utils.FindMaxIndexINf(totalScore)
-		//writer.Write([]string{"最优分片", fmt.Sprintf("%d", maxIndex), fmt.Sprintf("%f", maxScore)})
+
 		ol.PartitionMap[v] = maxIndex
+
 		return maxIndex
 	}
 	vNowShard := ol.PartitionMap[v] // 获取账户v当前分片id
@@ -199,6 +214,7 @@ func (ol *OLAAState) OLAA_Partition(v Vertex) int {
 }
 
 func (ol *OLAAState) ReOLAA_Partition(v Vertex) int {
+	ol.lambda = 1.0
 
 	ol.CalcCrossShardEdgeNum()
 	// 为输入账户寻找最合适的分片 placement
@@ -233,8 +249,36 @@ func (ol *OLAAState) ReOLAA_Partition(v Vertex) int {
 			totalScore[i] = 0
 		}
 	}
-	maxIndex, _ := utils.FindMaxIndexINf(totalScore)
 
-	//ol.PartitionMap[v] = maxIndex
+	// // 计算负载均衡得分(根据队列中的负载)
+	// scoreBal := make([]float64, size)
+	// //ol.MinEdges2Shard, ol.MaxEdges2Shard = utils.FindMinMax(ol.Edges2Shard)
+	// minQ, maxQ := utils.FindMinMax(ol.Queue2Shard)
+	// for i := 0; i < ol.ShardNum; i++ {
+	// 	scoreBal[i] = ol.lambda * float64(maxQ-ol.Queue2Shard[i]) / float64(ol.epsilon+maxQ-minQ)
+	// 	if _, ok := scoreCross[i]; ok {
+	// 		totalScore[i] = scoreBal[i] + scoreCross[i]
+	// 	} else {
+	// 		totalScore[i] = scoreBal[i]
+	// 	}
+	// }
+
+	maxIndex, _ := utils.FindMaxIndexINf(totalScore)
 	return maxIndex
+}
+
+// 计算节点迁移之后队列的标准差，把bestAddr迁移到bestShard
+func (ol *OLAAState) changeShardCOVRecompute(bestAddr string, bestShard int, count int) (float64, float64, []float64) {
+	loadBalance := utils.ConvertIntToFloat(ol.Edges2Shard)
+
+	lb := make([]float64, len(loadBalance))
+	copy(lb, loadBalance)
+
+	oldShardID := ol.PartitionMap[Vertex{Addr: bestAddr}]
+	newShardID := bestShard
+
+	lb[oldShardID] -= float64(count)
+	lb[newShardID] += float64(count)
+
+	return utils.Std(lb), utils.CoefficientOfVariation(lb), lb
 }

@@ -16,21 +16,27 @@ import (
 )
 
 type OLAA_Simulator struct {
-	txQueue map[int][]*transaction
-	ctx     float64
-	totaltx float64
-	mutex   sync.Mutex
-	txGraph *OLAAState
+	txQueue    map[int][]*transaction
+	ctx        float64
+	totaltx    float64
+	mutex      sync.Mutex
+	txGraph    *OLAAState
+	finishedtx []float64
+	counter    int
+	THctr      float64
 }
 
 func NewOLAA_Simulator() *OLAA_Simulator {
 	og := new(OLAAState)
 	og.Init_OLAAState(params.ShardNum, 1.5, 1, 0.5)
 	return &OLAA_Simulator{
-		txQueue: make(map[int][]*transaction),
-		ctx:     0.0,
-		totaltx: 0.0,
-		txGraph: og,
+		txQueue:    make(map[int][]*transaction),
+		ctx:        0.0,
+		totaltx:    0.0,
+		txGraph:    og,
+		finishedtx: make([]float64, params.ShardNum),
+		counter:    0,
+		THctr:      0.4,
 	}
 }
 
@@ -87,7 +93,8 @@ func (osi *OLAA_Simulator) Test_OLAA_Simulator() {
 						osi.totaltx += 0.5
 						tx.relayed = true
 						osi.txQueue[rsid] = append(osi.txQueue[rsid], tx)
-					} else {
+						osi.finishedtx[ssid]++
+					} else { //完成共识
 						tx.commitTime = time.Now()
 						latency := tx.commitTime.Sub(tx.time)
 						writeRes2CSV("OLAA+incre tx detail information", []string{tx.senderAddr, tx.receiptAddr, strconv.FormatBool(tx.relayed),
@@ -97,22 +104,28 @@ func (osi *OLAA_Simulator) Test_OLAA_Simulator() {
 						if tx.relayed {
 							osi.ctx += 0.5
 							osi.totaltx += 0.5
+							osi.finishedtx[rsid]++
 						} else {
 							osi.totaltx++
+							osi.finishedtx[ssid]++
 						}
-
 					}
 				}
 
 			}
 			osi.mutex.Unlock()
 			fmt.Printf("第%d次共识：此时跨分片交易数量%f,处理完的交易总量%f\n", consensusCounter, osi.ctx, osi.totaltx)
+			stringSlice := make([]string, len(osi.finishedtx))
+			for i, num := range osi.finishedtx {
+				stringSlice[i] = strconv.FormatFloat(num, 'f', 3, 64)
+			}
+			writeShard2CSV("finished txs number in every shard", stringSlice)
 		}
 	}()
 
 	// 监控队列长度
 	go func() {
-		ticker := time.Tick(50 * time.Second)
+		ticker := time.Tick(30 * time.Second)
 		for range ticker {
 			loadBalance := make([]float64, params.ShardNum)
 			stringSlice := make([]string, len(loadBalance))
@@ -130,17 +143,25 @@ func (osi *OLAA_Simulator) Test_OLAA_Simulator() {
 			fmt.Println("离散系数为:", covQ, "标准差为:", stdQ)
 
 			writeTXpool2CSV("OLAA+incre txPool", stringSlice)
+		}
+	}()
 
-			//离散程度较高，需要重划分
-			if stdQ > 3e4 || covQ > 1 {
+	// 监控图划分的质量
+	go func() {
+		ticker := time.Tick(100 * time.Second)
+		for range ticker {
+			mmap := make(map[string]uint64)
+			osi.mutex.Lock()
+			osi.txGraph.CalcCrossShardEdgeNum()
+			CTR, STD, COV := osi.txGraph.calculateCTR()
+			fmt.Printf("CTR: %f, STD: %f, COV: %f\n", CTR, STD, COV)
+			var item *NodePriorityItemforOLAA // 优先队列中第一个弹出的账户
+
+			if len(mmap) < 100 && (STD > 3e4 || COV > 1 || CTR > osi.THctr) { //负载均衡质量下降，ctr设计成弹性的，把上一轮更新完的结果作为下一轮的阈值
 				fmt.Println("start re-partitioning...")
-				moveAcc := make(map[string]uint64) // 节点id-新的分片id
-				osi.mutex.Lock()
-				// 重新获取当前loadbalance
-				for i, lst := range osi.txQueue {
-					loadBalance[i] = float64(len(lst))
-				}
-			
+				osi.counter++
+				fmt.Println("counter:", osi.counter)
+
 				// step 1. 遍历当前的交易队列，统计参与排队交易的节点，以及每个节点参与的交易数目
 				queueAccCount := osi.countRelatedAccounts()
 
@@ -149,49 +170,53 @@ func (osi *OLAA_Simulator) Test_OLAA_Simulator() {
 					osi.txGraph.push2priorityQueue(queueAcc.Account, queueAcc.Count)
 				}
 
-				// step 3. 按照虚拟节点跨片交易的比例，依次弹出优先队列中的节点
-				for osi.txGraph.pq.Len() > 0 {
-					item := heap.Pop(&osi.txGraph.pq).(*NodePriorityItemforOLAA)
-					for i := 0; i < params.ShardNum; i++ {
-						osi.txGraph.Queue2Shard[i] = int(loadBalance[i])
-					}
-					bestShard := osi.txGraph.ReOLAA_Partition(Vertex{Addr: item.Node}) //当前最佳位置
-					if bestShard == osi.txGraph.PartitionMap[Vertex{Addr: item.Node}] {
+				///////////// 根据优先队列的顺序，进行重划分////////////////////
+
+				for len(osi.txGraph.pq) > 0 {
+					heap.Init(&osi.txGraph.pq)
+					item = heap.Pop(&osi.txGraph.pq).(*NodePriorityItemforOLAA)
+
+					// 计算栈顶元素的最优分片
+					//fmt.Println(Vertex{Addr: (*item).Node}) // panic
+					oldShard := osi.txGraph.PartitionMap[Vertex{Addr: (*item).Node}]
+					bestShard := osi.txGraph.ReOLAA_Partition(Vertex{Addr: (*item).Node}) //当前最佳位置
+					if bestShard == oldShard {
 						continue
 					}
-					// 计算迁移节点到最佳位置对负载均衡的影响
-					newstdQ, newloadBalance := osi.txGraph.changeShardCOVRecompute(item, loadBalance, bestShard)
 
-					fmt.Printf("IF %s: migrate from %d to %d, txs count: %d", item.Node, osi.txGraph.PartitionMap[Vertex{Addr: item.Node}], bestShard, item.Count)
-					fmt.Println("loadbalance from", loadBalance, stdQ, "to", newloadBalance, newstdQ)
+					// 根据计算结果，更改分配
+					osi.txGraph.PartitionMap[Vertex{Addr: (*item).Node}] = bestShard
+					mmap[item.Node] = uint64(bestShard) //记录需要重划分的节点，用于账户迁移
+					// osi.txGraph.Queue2Shard更改？
 
-					if newstdQ < stdQ { //负载均衡有增益
-						stdQ = newstdQ
-						loadBalance = newloadBalance
-						fmt.Println("...此时负载情况", loadBalance)
-						// 更改分配
-						osi.txGraph.PartitionMap[Vertex{Addr: item.Node}] = bestShard
-						moveAcc[item.Node] = uint64(bestShard) //保留重新划分的虚拟节点
+					osi.txGraph.changeShardRecompute(Vertex{Addr: (*item).Node}, oldShard, bestShard)
+					CTR, STD, COV = osi.txGraph.calculateCTR()
+					fmt.Printf("-> CTR: %f, STD: %f, COV: %f\n", CTR, STD, COV)
 
-						// // 计算当前划分下的跨分片交易数目
-						// osi.txGraph.CalcCrossShardEdgeNum()
-					}
-					if stdQ <= 3e4 && stdQ < 1 {
+					// 算法推出条件
+					if len(mmap) > 100 || (STD < 3e4 && COV < 1 && CTR < osi.THctr) {
+						osi.THctr = CTR
+						fmt.Println("now threhold of ctr is:", osi.THctr)
 						break
 					}
-				}
-				// 清空优先队列
-				osi.txGraph.pq = make(NodePriorityQueueforOLAA, 0)
-				// 队列中交易迁移
-				if len(moveAcc) != 0 {
-					osi.migrationAcc(moveAcc)
+
 				}
 
-				fmt.Println("重划分完成...", loadBalance)
+				//fmt.Printf("IF %s: migrate from %d to %d, txs count: %d", item.Node, oldShard, bestShard, item.Count)
 
-				osi.mutex.Unlock()
+			} else {
+				osi.THctr = CTR
+				fmt.Println("now threhold of ctr is:", osi.THctr)
 			}
+			// 清空优先队列
+			osi.txGraph.pq = make(NodePriorityQueueforOLAA, 0)
+			// 队列中交易迁移
+			if len(mmap) != 0 {
+				osi.migrationAcc(mmap)
+			}
+			osi.mutex.Unlock()
 		}
+
 	}()
 
 	// 发布交易
@@ -214,15 +239,15 @@ func (osi *OLAA_Simulator) Test_OLAA_Simulator() {
 
 		// 即时账户分配算法，贪心算法：为新账户寻找最合适的分片
 		ssid := osi.txGraph.OLAA_Partition(s)
-		osi.txGraph.OLAA_Partition(r)
-		osi.mutex.Unlock()
+		rsid := osi.txGraph.OLAA_Partition(r)
+		if ssid == rsid {
+			osi.txGraph.Edges2Shard[ssid]++
+		} else {
+			osi.txGraph.Edges2Shard[ssid]++
+			osi.txGraph.Edges2Shard[rsid]++
+		}
 
-		// if rsid != ssid {
-		// 	osi.txGraph.Queue2Shard[rsid]++
-		// 	osi.txGraph.Queue2Shard[ssid]++
-		// } else {
-		// 	osi.txGraph.Queue2Shard[rsid]++
-		// }
+		osi.mutex.Unlock()
 
 		// 构建交易
 		tx := Newtransaction(s.Addr, r.Addr)
@@ -237,6 +262,7 @@ func (osi *OLAA_Simulator) Test_OLAA_Simulator() {
 				osi.txQueue[i] = append(osi.txQueue[i], txs...)
 			}
 			sendtoShard = make(map[int][]*transaction)
+			//fmt.Println("send 2500tx to txpool!")
 			time.Sleep(time.Second)
 		}
 		datanum++
@@ -273,8 +299,8 @@ func (osi *OLAA_Simulator) countRelatedAccounts() (result []AccountCountforG) {
 		return result[i].Count > result[j].Count
 	})
 	// 只保留交易数量前100的账户
-	if len(result) > 100 {
-		result = result[:100]
+	if len(result) > 1000 {
+		result = result[:1000]
 	}
 
 	return result
@@ -283,6 +309,13 @@ func (osi *OLAA_Simulator) countRelatedAccounts() (result []AccountCountforG) {
 // 根据重划分结果，对队列中的交易进行迁移
 func (osi *OLAA_Simulator) migrationAcc(mmap map[string]uint64) {
 	fmt.Println("需要迁移的虚拟节点", len(mmap)) //clpa可能会非常多
+
+	//////
+	loadBalance := make([]float64, params.ShardNum)
+	for i, lst := range osi.txQueue {
+		loadBalance[i] = float64(len(lst))
+	}
+	fmt.Println("迁移前的队列", loadBalance)
 
 	txSend := make(map[uint64][]*transaction) //需要迁移的交易
 	for shardID := 0; shardID < len(osi.txQueue); shardID++ {
@@ -314,9 +347,9 @@ func (osi *OLAA_Simulator) migrationAcc(mmap map[string]uint64) {
 	}
 
 	//////
-	loadBalance := make([]float64, params.ShardNum)
+	loadBalance = make([]float64, params.ShardNum)
 	for i, lst := range osi.txQueue {
 		loadBalance[i] = float64(len(lst))
 	}
-	fmt.Println("迁移后的负载", loadBalance)
+	fmt.Println("迁移后的队列", loadBalance)
 }
